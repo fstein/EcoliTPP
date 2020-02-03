@@ -1,0 +1,926 @@
+---
+title: "Ecoli mutants 2DTPP analysis - Version 2"
+subtitle: "XXXX"
+author: "Frank Stein"
+date: "`r date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = F,warning=F,cache = T)
+```
+
+#Initializing R session
+##Defining a working directory
+We defined the working directory for the analysis. 
+This directory should contain the output data from isobarQuant.
+```{r eval=F}
+setwd("~/home/path to the right file location")
+```
+
+##Defining some analysis functions
+
+```{r}
+add_col_to_df<-function(df,col_name,colvar_init=NA,Vector,
+                        data_col="Experiment.ID",Vectornames=NULL,
+                        create_column=T){
+  if(create_column)df[,col_name]<-colvar_init
+  df[,col_name]<-as.character(df[,col_name])
+  if(length(Vectornames)==0)Vectornames<-Vector
+  count=1
+  for(i in Vector){
+    print(i)
+    x<-Vectornames[count][1]
+    df[,col_name][grep(i,df[,data_col])]<-x
+    count=count+1
+  }
+  df[,col_name]<-factor(df[,col_name],ordered=T,levels=c(colvar_init,Vector))
+  return(df)
+}
+robustMean <- function(x){
+  if(length(x) == 1){return(x)}
+  else{
+    return(smhuber(x)$mu)
+  } 
+}
+estimate_mode <- function(x) {
+  x<-x[!is.na(x)]
+  d <- density(x)
+  d$x[which.max(d$y)]
+}
+glog2 <- function(x) ((asinh(x)-log(2))/log(2))
+```
+
+##Loading packages
+
+```{r}
+library(plyr)
+library(reshape)
+library(vsn)
+library(limma)
+library(Biobase)
+library(matrixStats)
+library(fdrtool)
+library(gridExtra)
+library(tidyverse)
+```
+
+##Loading data and defining experimental conditions vector
+
+```{r}
+conditions<-read.csv("metadata.csv")
+files<-unique(conditions$Path)
+files<-files[file.exists(file.path("data",files))]
+data<-NULL
+for(i in 1:length(files)){
+  file=files[i]
+  x<-read.delim(file.path("./data/",file))
+  x<-subset(x,!grepl("[K,k][R,r][T,t][0-9]",gene_name))
+  x<-subset(x,!grepl("#+",protein_id))
+  x<-subset(x,qupm>=2)
+  x$Path<-file
+  x<-x[,c("protein_id","description","gene_name","top3","Path","qupm",
+          grep("signal_sum",names(x),value = T))]
+  data<-rbind(data,x)
+  rm(x)
+}
+rm(files,i,file)
+names(data)
+str(data)
+```
+
+#Restructuring data
+
+```{r}
+data2<-data
+data2$description<-NULL
+data2$protein_id<-NULL
+data2<-unique(data2)
+mdata<-melt(data2,id.vars = c("gene_name","top3","Path","qupm"),
+            variable_name = "tmt.label")
+rm(data2)
+mdata$measurement<-gsub("_[0-9]+.+","",mdata$tmt.label)
+mdata$tmt.label<-gsub("([a-z,A-Z]+_)+","",mdata$tmt.label)
+mdata$tmt.label<-as.character(mdata$tmt.label)
+mdata<-merge(mdata,conditions)
+mdata$Experiment<-NULL;mdata$Path<-NULL
+mdata<-subset(mdata,!is.na(gene_name))
+mdata$average.top3<-"average.top3"
+mdata$found<-"found.in.reps"
+cdata<-cast(mdata,formula=gene_name~measurement+setup+Temperature+rep+tmt.label,
+            value = "value",fun.aggregate = mean,na.rm=T)
+cdata2<-cast(subset(mdata,measurement=="signal_sum"),
+             formula=gene_name~average.top3,
+             value = "top3",fun.aggregate = mean,na.rm=T)
+cdata<-merge(cdata,cdata2)
+cdata2<-cast(subset(mdata,measurement=="signal_sum"),formula=gene_name~found,
+             value = "top3",fun.aggregate = length)
+cdata2$found.in.reps<-cdata2$found.in.reps/11
+cdata<-merge(cdata,cdata2)
+#found.in.reps for each Temperature
+cdata2<-cast(subset(mdata,measurement=="signal_sum"),
+             formula=gene_name~found+Temperature,
+             value = "top3",fun.aggregate = length)
+cols<-names(cdata2)[names(cdata2)!="gene_name"]
+for(i in cols){
+  cdata2[,i]<-cdata2[,i]/11
+}
+cdata<-merge(cdata,cdata2)
+
+mdata$max.qupm<-"max.qupm"
+cdata2<-cast(subset(mdata,measurement=="signal_sum"),
+             formula=gene_name~max.qupm,value = "qupm",
+             fun.aggregate = max,na.rm=T)
+cdata<-merge(cdata,cdata2)
+#qupm for each Temperature
+cdata2<-cast(subset(mdata,measurement=="signal_sum"),
+             formula=gene_name~max.qupm+Temperature,value = "qupm",
+             fun.aggregate = max,na.rm=T)
+cdata<-merge(cdata,cdata2)
+#min.qupm for each Temperature
+mdata$max.qupm<-"min.qupm"
+cdata2<-cast(subset(mdata,measurement=="signal_sum"),
+             formula=gene_name~max.qupm+Temperature,value = "qupm",
+             fun.aggregate = min,na.rm=T)
+cdata<-merge(cdata,cdata2)
+rm(cdata2)
+```
+
+#Filtering data
+```{r}
+dim(cdata)
+cdata<-subset(cdata,max.qupm>=2&found.in.reps>=10&
+                (found.in.reps_42>=2|found.in.reps_45.4>=2))
+dim(cdata)
+```
+
+#Building expression set
+For the analysis of proteomics data, many popular methods from the 
+microarray-field are borrowed. In order to directly apply the methods, 
+the proteomics data are stored in an "Expression Set" data type.
+
+##Constructing assay data
+
+```{r}
+raw_data<-cdata
+rownames(raw_data)<-raw_data$gene_name
+raw_data$gene_name<-NULL
+raw_data<-raw_data[,grep("signal_sum",names(raw_data),value=T)]
+names(raw_data)<-gsub("signal_sum_","",names(raw_data))
+raw_data<-as.data.frame(raw_data)
+```
+
+##Constructing metadata
+
+```{r}
+metadata<-data.frame(col.name=names(raw_data))
+metadata<-add_col_to_df(metadata,data_col = "col.name",col_name = "tmt.label",
+                        Vector = c("126","127L","127H","128L","128H","129L",
+                                   "129H","130L","130H","131L","131H"))
+metadata<-add_col_to_df(metadata,data_col = "col.name",col_name = "Temperature",
+                        Vector = as.character(sort(unique(conditions$Temperature))))
+metadata<-add_col_to_df(metadata,data_col = "col.name",col_name = "rep",
+                        Vector = c("rep1","rep2","rep3","rep4","rep5"))
+metadata<-merge(metadata,conditions,sort=F)
+metadata$ID<-metadata$col.name
+metadata$condition<-with(metadata,paste0(setup,"_",Temperature))
+```
+
+##Constructing feature data
+
+```{r}
+rownames(metadata)<-metadata$ID
+colnames(raw_data)<-metadata$ID
+```
+
+##Transformation of raw signal_sum data
+
+The log2 is computed from the raw signal intensities. Furthermore, 
+infinite values are transformed into missing (NA) values.
+```{r}
+raw_data_m<-log2(as.matrix(raw_data))
+raw_data_m[is.infinite((raw_data_m))]<-NA
+raw_data_m[is.nan((raw_data_m))]<-NA
+```
+
+##Constructing the Expression set
+
+```{r}
+raw_dataE <- ExpressionSet(assayData = raw_data_m,
+                           phenoData = AnnotatedDataFrame(metadata))
+validObject(raw_dataE)
+rm(raw_data_m,metadata,raw_data,mdata)
+```
+
+#Remove Batcheffects
+Batcheffects are removed by fitting a linear model to the data that try to 
+explain the replicates. The batch effect is than subtracted from the data 
+applying the limma package.
+
+```{r}
+batchcleaned_raw_dataE<-raw_dataE
+exprs(batchcleaned_raw_dataE)<-
+  removeBatchEffect(exprs(batchcleaned_raw_dataE),
+    batch=as.character(pData(batchcleaned_raw_dataE)$rep),
+    design=model.matrix(~as.character(pData(batchcleaned_raw_dataE)$condition)))
+```
+
+#Normalization
+The vsn package from Wolfgang Huber is used to apply a variance stabilization 
+normalization method on the log2 raw data. Since it is a TPP experiment, 
+each temperature is normalized separately. Therefore, the expression set 
+has to be reconstructed again.
+```{r}
+norm_batchcleaned_raw_dataE<-batchcleaned_raw_dataE
+for(ng in unique(conditions$Temperature)){
+  print(ng)
+  vsn.fit<-vsn2(2^exprs(norm_batchcleaned_raw_dataE[ ,
+                                  norm_batchcleaned_raw_dataE$Temperature==ng]))
+  test<-predict(vsn.fit,2^exprs(norm_batchcleaned_raw_dataE[ ,
+                                  norm_batchcleaned_raw_dataE$Temperature==ng]))
+  for(cn in colnames(test)){
+    exprs(norm_batchcleaned_raw_dataE)[ ,cn]<-test[,cn]
+  }
+  ttest<-meanSdPlot(vsn.fit,plot = F)
+  print(ttest$gg+ggtitle(ng))
+  rm(vsn.fit)
+}
+rm(test,ng)
+```
+
+#Merge normalized data back into 'data'
+```{r}
+cd<-as.data.frame(2^exprs(batchcleaned_raw_dataE))
+names(cd)<-paste0("batchcleaned_raw_signal_sum_",names(cd))
+cd$gene_name<-rownames(cd)
+cdata<-merge(cdata,cd)
+rm(cd)
+cd<-as.data.frame(2^exprs(norm_batchcleaned_raw_dataE))
+names(cd)<-paste0("norm_signal_sum_",names(cd))
+cd$gene_name<-rownames(cd)
+cdata<-merge(cdata,cd)
+rm(cd)
+```
+
+#Calculation of fold changes
+
+```{r}
+fc<-cdata[,c("gene_name",grep("norm_signal_sum",names(cdata),value=T),
+             grep("max.qupm_",names(cdata),value=T))]
+names(fc)[grepl("norm_signal_sum",names(fc))]<-gsub("_[0-9]+.$","",
+                                                    names(fc)[grepl("norm_signal_sum",
+                                                                    names(fc))])
+names(fc)<-gsub("norm_signal_sum_","",names(fc))
+cols<-ncol(fc)
+initial.names<-names(fc)
+temps<-as.character(unique(conditions$Temperature))
+setups<-as.character(unique(conditions$Compound))
+reps<-as.character(unique(conditions$rep))
+
+for(temp in temps){
+  for(setup in setups){
+    for(rep in reps){
+      name<-paste0(setup,".median_",temp,"_",rep,".setupr")
+      if(paste0(setup,"_",temp,"_",rep)%in%initial.names){
+        fc[,name]<-fc[,paste0(setup,"_",temp,"_",rep)]/
+          apply(X=fc[,grep(paste0(temp,"_",rep),initial.names)],
+                MARGIN = 1,FUN = median,na.rm=T)
+        fc[,name][fc[,paste0("max.qupm_",temp)]<2]<-NA
+      }
+    }
+  }
+}
+setups<-as.character(unique(conditions$setup))
+for(setup in setups){
+  for(temp in temps){
+    for(rep in reps){
+      if(paste0(setup,"_",temp,"_",rep)%in%initial.names){
+        name<-paste0(setup,"_",temp,"_",rep,".42.tempr")
+        fc[,name]<-fc[,paste0(setup,"_",temp,"_",rep)]/
+          fc[,paste0(setup,"_42","_",rep)]
+        fc[,name][fc[,paste0("max.qupm_",temp)]<2]<-NA
+      }
+    }
+  }
+}
+
+fc<-fc[,-c(2:cols)]
+rm(temps,setups,temp,setup,rep,reps,initial.names)
+cdata<-merge(cdata,fc)
+```
+
+#Individual plots for each protein
+
+```{r}
+mfc<-melt(cdata[,c("gene_name","average.top3","max.qupm",
+                   grep("^signal_sum",names(cdata),value=T),
+                   grep("^batchcleaned_raw_signal_sum",names(cdata),value=T),
+                   grep("norm_signal_sum",names(cdata),value=T),
+                   grep("setupr$",names(cdata),value=T),
+                   grep("tempr$",names(cdata),value=T))],
+          id.vars = c("gene_name","average.top3","max.qupm"))
+mfc<-add_col_to_df(mfc,col_name = "measurement",data_col = "variable",
+                   Vector=c("signal_sum","batchcleaned_raw_signal_sum",
+                            "norm_signal_sum","setupr","tempr"))
+mfc$variable<-gsub(".+ignal_sum_","",mfc$variable)
+mfc$variable<-gsub("_[0-9]+$","",mfc$variable)
+mfc$variable<-gsub("_[0-9]+[H,L]$","",mfc$variable)
+mfc$variable<-gsub(".setupr$","",mfc$variable)
+mfc$variable<-gsub(".ctrl","",mfc$variable)
+mfc$variable<-gsub(".42.tempr$","",mfc$variable)
+mfc$rep<-mfc$variable
+mfc$variable<-gsub("_rep[0-9]+$","",mfc$variable)
+names(mfc)[grep("variable",names(mfc))]<-c("condition")
+mfc$experiment<-mfc$condition
+mfc$rep<-gsub(".+_","",mfc$rep)
+mfc$Temperature<-gsub(".+_","",mfc$condition)
+mfc$experiment<-gsub("_[0-9,.]+$","",mfc$experiment)
+mfc<-na.omit(mfc)
+mfc$measurement<-revalue(mfc$measurement,replace = c("setupr"="ctrl.ratio",
+                                                     "tempr"="T42C.ratio"))
+mfc$condition<-paste(gsub("_vs.+","",mfc$experiment),mfc$Temperature,sep = "_")
+mfc$condition<-gsub(".median_","_",mfc$condition)
+mfc$experiment<-gsub(".median","",mfc$experiment)
+
+mfc2<-mfc%>%
+  spread(key = measurement,value = value)
+
+mfc3<-mfc2
+
+conditions$condition<-with(conditions,paste0(setup,"_",Temperature))
+mfc2<-merge(mfc2,conditions,all=T)
+mfc2$temp<-as.numeric(as.character(mfc2$Temperature))
+mfc2$Temperature<-factor(mfc2$Temperature)
+write.csv(mfc2,file.path("..","full_datasets",
+                              paste0(unique(conditions$Compound),
+                                     "_full_data_long_V2.csv")))
+```
+
+#Normalization QC-plot
+
+```{r fig.height=7}
+ggplot(data=subset(mfc,measurement%in%c("signal_sum", 
+                                        "batchcleaned_raw_signal_sum", 
+                                        "norm_signal_sum")),
+       aes(Temperature,log2(value),fill=experiment,
+           group=paste(condition,rep)))+theme_bw(base_size=12)+
+  geom_boxplot()+
+  facet_wrap(~measurement,scale="free")
+ggsave("QC_plot-normalization_V2.pdf",width=30,height=15)
+ggplot(data=subset(mfc,!measurement%in%c("signal_sum", 
+                                         "batchcleaned_raw_signal_sum",
+                                         "norm_signal_sum")&!is.na(experiment)),
+       aes(Temperature,log2(value),
+           fill=experiment,
+           group=paste(Temperature,experiment,rep)))+
+  theme_bw(base_size=12)+geom_boxplot()+
+  facet_wrap(~measurement,scale="free")
+ggsave("QC_plot-normalization_fc_V2.pdf",width=15,height=15)
+```
+
+#LIMMA analysis
+
+##Creating limma data set
+
+```{r}
+limma.score.data<-mfc2%>%
+  filter(!is.na(ctrl.ratio))%>%
+  group_by(gene_name,experiment,Temperature,rep)%>%
+  summarise(ratio=median(ctrl.ratio))
+limma.score.data.length<-mfc2%>%
+  dplyr::filter(!is.na(ctrl.ratio),
+                Temperature%in%sort(unique(mfc2$Temperature))[1:2])%>%
+  group_by(gene_name,experiment,rep)%>%
+  summarise(reps.abundance=length(ctrl.ratio))
+limma.score.data<-left_join(limma.score.data,limma.score.data.length)
+rm(limma.score.data.length)
+limma.score.data.length<-mfc2%>%
+  filter(!is.na(ctrl.ratio))%>%
+  group_by(gene_name,experiment,rep)%>%
+  summarise(No.of.Ts.with.2.reps=length(ctrl.ratio))#%>%
+limma.score.data<-left_join(limma.score.data,limma.score.data.length)
+rm(limma.score.data.length)
+score.data.length<-mfc2%>%
+  subset(!is.na(ctrl.ratio))%>%
+  subset(Temperature%in%sort(unique(mfc2$Temperature))[1:2])%>%
+  group_by(gene_name,experiment,Temperature)%>%
+  summarise(rep=length(ctrl.ratio))%>%
+  filter(rep>=2)%>%
+  dplyr::select(gene_name,experiment)%>%
+  group_by(gene_name,experiment)%>%
+  summarise(Freq=length(experiment))%>%
+  filter(Freq>=1)%>%
+  dplyr::select(gene_name,experiment)%>%
+  mutate(abundance.score.valid=T)
+limma.score.data<-left_join(limma.score.data,score.data.length)
+rm(score.data.length)
+score.data.length<-mfc2%>%
+  filter(!is.na(ctrl.ratio))%>%
+  group_by(gene_name,experiment,Temperature)%>%
+  summarise(rep=length(ctrl.ratio))%>%
+  filter(rep>=2)%>%
+  mutate(stability.score.valid=T)%>%
+  dplyr::select(gene_name,experiment,Temperature,stability.score.valid)
+limma.score.data<-left_join(limma.score.data,score.data.length)
+rm(score.data.length)
+abundance.score<-limma.score.data%>%
+  subset(Temperature%in%sort(unique(limma.score.data$Temperature))[1:2])%>%
+  subset(abundance.score.valid&stability.score.valid)%>%
+  group_by(gene_name,experiment,rep)%>%
+  summarise(abundance.score=mean(log2(ratio),na.rm=T))
+limma.score.data<-left_join(limma.score.data,abundance.score)
+limma.score.data<-limma.score.data%>%
+  mutate(stability=log2(ratio)-abundance.score)
+stability.score<-limma.score.data%>%
+  subset(stability.score.valid)%>%
+  group_by(gene_name,experiment,rep)%>%
+  summarise(stability.score=sum(stability,na.rm=T))
+limma.score.data<-left_join(limma.score.data,stability.score)
+rm(abundance.score,stability.score)
+limma.score.data<-limma.score.data%>%
+  group_by(gene_name,experiment,rep)%>%
+  dplyr::select(gene_name,experiment,reps.abundance,No.of.Ts.with.2.reps,
+                abundance.score.valid,stability.score.valid,
+                rep,abundance.score,stability.score)
+limma.score.data<-unique(limma.score.data)
+limma.score.data<-limma.score.data%>%
+  mutate(id=paste0(experiment,"_",rep))%>%
+  group_by(gene_name,id)%>%
+  dplyr::select(gene_name,id,reps.abundance,No.of.Ts.with.2.reps,
+                abundance.score.valid,stability.score.valid,
+                abundance.score,stability.score)%>%
+  filter(reps.abundance>=1,No.of.Ts.with.2.reps>=4)
+write.csv(limma.score.data,file.path("..","raw_score_data",
+                              paste0(unique(conditions$Compound),
+                                     "_raw_score_data_V2.csv")))
+```
+
+##Constructing expression sets for abundance and stability data
+
+```{r}
+##abundance
+abundance.data<-limma.score.data%>%
+  group_by(gene_name)%>%
+  dplyr::select(gene_name,id,abundance.score)%>%
+  unique()%>%
+  spread(id,abundance.score)
+abundance.weights<-limma.score.data%>%
+  group_by(gene_name)%>%
+  dplyr::select(gene_name,id,reps.abundance)%>%
+  unique()%>%
+  spread(id,reps.abundance)
+abundance.weights<-base::as.data.frame(abundance.weights)
+rownames(abundance.weights)<-abundance.weights$gene_name
+abundance.weights$gene_name<-NULL
+abundance.weights<-as.matrix(abundance.weights)
+abundance.data<-base::as.data.frame(abundance.data)
+rownames(abundance.data)<-abundance.data$gene_name
+abundance.data$gene_name<-NULL
+abundance.metadata<-data.frame(ID=names(abundance.data))
+abundance.metadata$condition<-gsub("_.+","",abundance.metadata$ID)
+abundance.metadata$rep<-gsub(".+_","",abundance.metadata$ID)
+rownames(abundance.metadata)<-abundance.metadata$ID
+colnames(abundance.data)<-abundance.metadata$ID
+abundance.data<-as.matrix(abundance.data)
+abundance.dataE<- ExpressionSet(assayData = abundance.data,
+                           phenoData = AnnotatedDataFrame(abundance.metadata))
+validObject(abundance.dataE)
+rm(abundance.data,abundance.metadata)
+
+##stability
+stability.data<-limma.score.data%>%
+  group_by(gene_name)%>%
+  dplyr::select(gene_name,id,stability.score)%>%
+  unique()%>%
+  spread(id,stability.score)
+stability.weights<-limma.score.data%>%
+  group_by(gene_name)%>%
+  dplyr::select(gene_name,id,No.of.Ts.with.2.reps)%>%
+  unique()%>%
+  spread(id,No.of.Ts.with.2.reps)
+stability.weights<-base::as.data.frame(stability.weights)
+rownames(stability.weights)<-stability.weights$gene_name
+stability.weights$gene_name<-NULL
+stability.data<-base::as.data.frame(stability.data)
+rownames(stability.data)<-stability.data$gene_name
+stability.data$gene_name<-NULL
+stability.metadata<-data.frame(ID=names(stability.data))
+stability.metadata$condition<-gsub("_.+","",stability.metadata$ID)
+stability.metadata$rep<-gsub(".+_","",stability.metadata$ID)
+rownames(stability.metadata)<-stability.metadata$ID
+colnames(stability.data)<-stability.metadata$ID
+stability.data<-as.matrix(stability.data)
+stability.dataE<- ExpressionSet(assayData = stability.data,
+                           phenoData = AnnotatedDataFrame(stability.metadata))
+validObject(stability.dataE)
+rm(stability.data,stability.metadata)
+```
+
+##Limma evaluation of stability and abundance scores
+
+```{r}
+limma_results<-NULL
+```
+
+##Construction of design matrix and defining conditions that will be compared
+
+```{r fig.height=7}
+limma_data=abundance.dataE
+condition<-factor(pData(limma_data)$condition,ordered=F)
+replicate<-factor(pData(limma_data)$rep,ordered=F)
+condition_d<-model.matrix(~1)
+to_condition<-as.character(unique(conditions$Compound))
+mut_comparison<-eBayes(lmFit(limma_data,weights = abundance.weights^2))
+res <- limma::topTable(mut_comparison, sort.by = "t",  
+                       coef = 1, number = Inf)
+res$gene_name<-rownames(res)
+names(res)[grep("P.Value",names(res))]<-"pvalue.limma"
+names(res)[grep("adj.P.Val",names(res))]<-"fdr.limma"
+res<-subset(res,!is.na(logFC))
+fdr_res<-NULL
+try(fdr_res <- fdrtool(res$t, plot =T, verbose = F))
+if(length(fdr_res)>0){
+  res$pvalue.fdrtool<-fdr_res$pval
+  res$qval.fdrtool <- fdr_res$qval
+  res$lfdr.fdrtool <- fdr_res$lfdr
+}
+res$comparison <- paste("abundance -",to_condition)
+limma_results<-rbind(limma_results,res)
+
+limma_data=stability.dataE
+condition<-factor(pData(limma_data)$condition,ordered=F)
+replicate<-factor(pData(limma_data)$rep,ordered=F)
+condition_d<-model.matrix(~1)
+to_condition<-as.character(unique(conditions$Compound))
+mut_comparison<-eBayes(lmFit(limma_data,weights = stability.weights^2))
+res <- limma::topTable(mut_comparison, sort.by = "t",  
+                       coef = 1, number = Inf)
+res$gene_name<-rownames(res)
+names(res)[grep("P.Value",names(res))]<-"pvalue.limma"
+names(res)[grep("adj.P.Val",names(res))]<-"fdr.limma"
+res<-subset(res,!is.na(logFC))
+fdr_res<-NULL
+try(fdr_res <- fdrtool(res$t, plot =T, verbose = F))
+if(length(fdr_res)>0){
+  res$pvalue.fdrtool<-fdr_res$pval
+  res$qval.fdrtool <- fdr_res$qval
+  res$lfdr.fdrtool <- fdr_res$lfdr
+}
+res$comparison <- paste("stability -",to_condition)
+limma_results<-rbind(limma_results,res)
+```
+
+##Limma and fdrtool statistics comparison
+
+```{r fig.height=7}
+ggplot(data=limma_results,aes(abs(t)))+
+  geom_line(aes(y=fdr.limma,colour="limma - adj.P.Val"))+
+  geom_line(aes(y=qval.fdrtool,colour="fdrtool - qval"))+
+  geom_point(aes(y=fdr.limma,colour="limma - adj.P.Val"))+
+  geom_point(aes(y=qval.fdrtool,colour="fdrtool - qval"))+
+  facet_wrap(~comparison,scale="free_x")+ylab("fdr")+
+  theme_bw(base_size=12)+
+  scale_colour_brewer(palette="Set1")
+ggsave("t_vs_fdr_limma_vs_fdrtool_V2.pdf",width=15,height=10)
+
+ggplot(data=limma_results)+
+  geom_histogram(aes(pvalue.limma,alpha=0.5,fill="limma"),bins=50)+
+  facet_wrap(~comparison,scale="free_y")+
+  geom_histogram(aes(pvalue.fdrtool,alpha=0.5,fill="fdrtool"),bins=50)+
+  guides(alpha=F)+xlab("p-value")+
+  theme_bw(base_size=12)+
+  scale_fill_brewer(palette="Set1")
+ggsave("p-value_histogram_limma_vs_fdrtool_V2.pdf",width=15,height=10)
+```
+
+##Hit annotation
+
+```{r}
+limma_results$hit_annotation_method<-NA
+fdr_hit_threshold<-0.05
+fdr_candidate_threshold=0.1
+fc_hit_threshold<-1.5
+fc_candidate_threshold<-1
+limma_results$pvalue<-NA
+limma_results$fdr<-NA
+for(comp in unique(limma_results$comparison)){
+  limma_hits<-
+    nrow(limma_results[limma_results$comparison==comp&
+                         limma_results$fdr.limma<=fdr_hit_threshold,])
+  fdrtool_hits<-
+    nrow(limma_results[limma_results$comparison==comp&
+                         limma_results$qval.fdrtool<=fdr_hit_threshold,])
+  if(limma_hits>=fdrtool_hits){
+    limma_results$hit_annotation_method[limma_results$comparison==comp]<-"limma"
+  }
+  if(fdrtool_hits>limma_hits){
+    limma_results$hit_annotation_method[limma_results$comparison==comp]<-"fdrtool"
+  }
+  rm(limma_hits,fdrtool_hits)
+}
+table(limma_results$hit_annotation_method)
+limma_results$hit_annotation_method<-"fdrtool"
+
+limma_results$pvalue[limma_results$hit_annotation_method=="limma"]<-
+  limma_results$pvalue.limma[limma_results$hit_annotation_method=="limma"]
+limma_results$fdr[limma_results$hit_annotation_method=="limma"]<-
+  limma_results$fdr.limma[limma_results$hit_annotation_method=="limma"]
+
+limma_results$pvalue[limma_results$hit_annotation_method=="fdrtool"]<-
+  limma_results$pvalue.fdrtool[limma_results$hit_annotation_method=="fdrtool"]
+limma_results$fdr[limma_results$hit_annotation_method=="fdrtool"]<-
+  limma_results$qval.fdrtool[limma_results$hit_annotation_method=="fdrtool"]
+
+limma_results$hit<-with(limma_results,
+                        ifelse(fdr<=fdr_hit_threshold&abs(logFC)>=
+                                 log2(fc_hit_threshold),T,F))
+limma_results$hit_annotation<-with(limma_results,
+                                   ifelse(fdr<=fdr_hit_threshold&abs(logFC)>=
+                                            log2(fc_hit_threshold),"hit",
+                                          ifelse(fdr<=fdr_candidate_threshold&abs(logFC)>=
+                                                   log2(fc_candidate_threshold),
+                                                 "candidate","no hit")))
+limma_results$hit_annotation<-factor(limma_results$hit_annotation,ordered=T,
+                                     levels=c("hit","candidate","no hit"))
+
+with(limma_results,table(comparison,hit_annotation))
+```
+
+##Save limma results
+
+```{r}
+write.csv(limma_results,file.path("..","summarized_limma_results",
+                              paste0(unique(conditions$Compound),
+                                     "_Limma_results_V2.csv")))
+write.csv(limma_results,"Limma_results_V2.csv",row.names=F)
+```
+
+##Merge limma significances with raw score data
+
+```{r}
+limma.cp.data<-limma.score.data%>%
+  group_by(gene_name,id,reps.abundance,No.of.Ts.with.2.reps)%>%
+  gather(key = score,value=score.value,-gene_name,-id,-reps.abundance,
+         -No.of.Ts.with.2.reps,-stability.score.valid,-abundance.score.valid)
+limma.cp.data$condition<-gsub("_.+","",limma.cp.data$id)
+limma.cp.data$rep<-gsub(".+_","",limma.cp.data$id)
+limma.sub<-limma_results[,c("gene_name","fdr","comparison")]
+limma.sub$score<-gsub(" - .+",".score",limma.sub$comparison)
+limma.sub$comparison<-NULL
+limma.cp.data<-left_join(limma.cp.data,limma.sub)
+
+
+
+limma.cp.data$fdr.star<-
+  as.character(cut(as.numeric(as.character(limma.cp.data$fdr)),
+                   breaks=c(0,0.001,0.01,0.05,1),
+                   include.lowest = T))
+limma.cp.data$fdr.star[is.na(limma.cp.data$fdr.star)]<-""
+limma.cp.data$fdr.star<-revalue(limma.cp.data$fdr.star,replace = 
+                                  c("(0.05,1]"="",
+                                    "(0.01,0.05]"="*",
+                                    "(0.001,0.01]"="**",
+                                    "[0,0.001]"="***"))
+```
+
+##Volcano-Plot
+
+```{r fig.height=7}
+qplot(logFC,-log10(pvalue),data=limma_results,colour=hit_annotation)+
+  geom_vline(aes(xintercept=0))+
+  facet_wrap(~comparison+hit_annotation_method,scale="free_x")+
+  geom_text(aes(label=gene_name),
+            data=subset(limma_results,hit_annotation!="no hit"),
+            vjust = 0, nudge_y = 0.1,size=2,check_overlap = F)+
+  theme_bw(base_size=12)+
+  scale_colour_brewer(palette="Set1")
+ggsave("Volcano_plot_V2.pdf",width=15,height=10)
+```
+
+##Correlation of limma results
+
+```{r fig.height=7}
+cor.data<-limma_results[,c("gene_name","hit_annotation","logFC","comparison")]
+cor.data$comparison<-gsub(" -.+","",cor.data$comparison)
+cor.data$hit<-cor.data$hit_annotation
+cor.data$hit_annotation<-NULL
+cor.data<-unique(cor.data)
+cor.data<-subset(cor.data,gene_name!="")
+ccor.data<-cast(cor.data,formula=gene_name~comparison,value = "logFC")
+ccor.data2<-cast(cor.data,formula=gene_name~comparison,value = "hit")
+names(ccor.data2)[-1]<-paste0("hit_",names(ccor.data2)[-1])
+ccor.data<-merge(ccor.data,ccor.data2)
+ccor.data<-na.omit(ccor.data)
+rm(cor.data,ccor.data2)
+ccor.data$hit<-paste(ccor.data$hit_abundance,"abundance -",
+                     ccor.data$hit_stability,"stability")
+ccor.data$hit<-factor(ccor.data$hit,ordered=T,
+                      levels=c("hit abundance - hit stability",
+                               "hit abundance - candidate stability",
+                               "hit abundance - no hit stability",
+                               "candidate abundance - hit stability",
+                               "no hit abundance - hit stability",
+                               "candidate abundance - candidate stability",
+                               "candidate abundance - no hit stability",
+                               "no hit abundance - candidate stability",
+                               "no hit abundance - no hit stability"))
+ggplot(data=na.omit(ccor.data),aes(abundance,stability,colour=hit))+
+  guides(alpha=F)+theme_bw(base_size=12)+
+  geom_abline()+
+  scale_color_brewer(palette="Set1")+
+  geom_vline(aes(xintercept=0))+
+  geom_hline(aes(yintercept=0))+
+  geom_point(alpha=0.3)+
+  geom_text(data=subset(ccor.data,abs(abundance)>=log2(1.5)|
+                          abs(stability)>=log2(1.5)),aes(label=gene_name),
+            vjust = 0, nudge_y = 0.1,size=2)+
+  xlab("abundance score")+
+  ylab("stability score")
+ggsave("limma_correlation_plot_V2.pdf",width=20,height=20)
+write.csv(ccor.data,"limma_correlation_data_V2.csv")
+```
+
+#Create Excel-Sheet for data browsing
+```{r}
+mfc3<-mfc2
+mfc3<-subset(mfc3,signal_sum!=0)
+#median ctrl.ratio
+odata<-cast(subset(mfc3,as.character(Compound)==as.character(experiment)),
+            formula=gene_name+Temperature~experiment+rep,
+            value="ctrl.ratio")
+
+#found in Temperatures
+odata2<-cast(subset(mfc3,as.character(Compound)==as.character(experiment)),
+             formula=gene_name~experiment,
+             value="ctrl.ratio",fun.aggregate=length)
+odata2$found.in.all.Ts<-odata2[,2]
+odata2<-odata2[,c("gene_name","found.in.all.Ts")]
+odata<-merge(odata,odata2,all.x=T)
+rm(odata2)
+#
+odata2<-cast(subset(mfc3,as.character(Compound)==as.character(experiment)&
+                      !is.na(ctrl.ratio)),
+             formula=gene_name+Temperature~experiment,
+             value="ctrl.ratio",fun.aggregate=length)
+odata2$found.in.Ts<-odata2[,3]
+odata2<-odata2[,c("gene_name","Temperature","found.in.Ts")]
+odata<-merge(odata,odata2,all.x=T)
+odata$found.in.Ts[is.na(odata$found.in.Ts)]<-0
+rm(odata2)
+
+modata<-melt(cdata[,c("gene_name","average.top3",
+                      grep(".qupm_",names(cdata),value=T))],
+             id.vars = c("gene_name","average.top3"))
+modata$Temperature<-gsub(".+_","",modata$variable)
+modata$variable<-gsub("_.+","",modata$variable)
+modata<-cast(modata,formula=gene_name+average.top3+Temperature~variable)
+odata<-merge(odata,modata,all.x=T)
+
+odata$path<-file.path(".","plots_combined",
+                      paste0(gsub("\\|","-",odata$gene_name),".pdf"))
+des<-data[,c("gene_name","description")]
+des<-subset(des,gene_name%in%unique(odata$gene_name))
+des<-unique(des)
+dupnames<-names(which(sort(table(des$gene_name),decreasing = T)>1))
+des.dups<-subset(des,gene_name%in%dupnames)
+des<-subset(des,!gene_name%in%dupnames)
+des.dups.new<-NULL
+for(gene in as.character(unique(des.dups$gene_name))){
+  sub<-subset(des.dups,gene_name==gene)
+  sub<-sub[which(nchar(sub$description)==max(nchar(sub$description)))[1],]
+  sub<-data.frame(gene_name=sub$gene_name,description=sub$description)
+  des.dups.new<-rbind(des.dups.new,sub)
+  rm(sub)
+}
+des<-rbind(des,des.dups.new)
+rm(des.dups.new,des.dups)
+odata<-merge(odata,des)
+rm(des)
+odata<-odata[,c("gene_name","description","found.in.all.Ts", "found.in.Ts",
+                "average.top3", "min.qupm","max.qupm","Temperature",
+                grep("_rep.+$",names(odata),value=T),"path")]
+
+write.csv(odata,"Final_results_V2.csv")
+
+hd<-limma_results[,c("gene_name","comparison","hit_annotation")]
+hd$score<-gsub(" -.+",".hit.annotation",hd$comparison)
+hd$comparison<-NULL
+hd<-cast(data=hd,formula=gene_name~score,value="hit_annotation")
+rodata<-merge(odata,hd,all=T)
+rodata<-rodata[order(rodata$gene_name,rodata$Temperature),]
+rodata$gene_name2<-paste0("'",rodata$gene_name)
+write.csv(rodata,"Final_results_classified_V2.csv")
+rm(mfc3)
+
+
+sodata<-unique(odata[,c("gene_name","description","found.in.all.Ts",
+                        "average.top3","path")])
+limma_spread<-limma_results[,c("gene_name","comparison","logFC","fdr",
+                               "hit_annotation")]
+limma_spread<-melt(limma_spread,id.vars = c("gene_name","comparison"))
+limma_spread$score<-gsub(" - .+","",limma_spread$comparison)
+limma_spread$comparison<-NULL
+limma_spread<-cast(limma_spread,formula=gene_name~variable+score)
+sodata<-merge(sodata,limma_spread,all=T)
+write.csv(sodata,"Limma_results_classified_V2.csv")
+```
+
+#Save workspace
+```{r}
+save.image("Workspace_V2.RData")
+```
+
+#Save individual plots for each protein
+```{r eval=F}
+dir_save="plots_combined"
+if(!dir.exists(file.path(getwd(),dir_save))){
+  dir.create(file.path(getwd(),dir_save))
+}
+h=15
+w=15
+cols<-c("#e41a1c","#377eb8","#4daf4a","#984ea3","#ff7f00","#ffff33","#a65628",
+        "#f781bf","#999999","#1b9e77","#d95f02","#7570b3","#e7298a","#66a61e",
+        "#e6ab02","#a6761d")
+
+limits.limma=quantile(limma.cp.data$score.value,probs = c(0.001,0.999),na.rm=T)
+for(gene in as.character(unique(subset(cdata)$gene_name))){
+  gene.name<-gsub("\\|","-",gene)
+  f.name<-file.path(dir_save,paste0(gene.name,".pdf"))
+  if(!file.exists(f.name)){
+    pdf(width=w,height=h,file = f.name)
+    sub<-subset(mfc2,gene_name==gene)
+    sub$setup2<-as.character(sub$setup)
+    sub$setup2[as.character(sub$setup)!=as.character(sub$Compound)]<-
+      "average other mutants"
+    sub$setup2<-paste(sub$setup2,sub$rep)
+    average.top3=round(as.numeric(as.character(unique(sub$average.top3)[1])),digits = 2)
+    max.qupm<-round(as.numeric(as.character(unique(sub$max.qupm)[1])))
+    ptitle<-paste(gene,"-","average.top3:",average.top3,"-","max.qupm:",max.qupm)
+    
+    try(p1<-ggplot(data=subset(sub),aes(paste(rep,Temperature),setup))+
+          geom_tile(aes(fill=log2(norm_signal_sum)))+
+          scale_fill_gradientn(colours = c("#377eb8",
+                                           "#984ea3",
+                                           "#e41a1c",
+                                           "#ff7f00",
+                                           "#ffff33"))+
+          xlab("condition")+
+          theme_bw(base_size=12)+
+          theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust=0.5)))
+    try(p2<-ggplot(data=sub,aes(temp,log2(norm_signal_sum),fill=setup2,colour=setup2))+
+          stat_summary(fun.data="mean_se",geom="smooth")+theme_bw(base_size=12)+ 
+          theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+          scale_fill_manual(values = cols)+
+          scale_colour_manual(values = cols)+
+          stat_summary(fun.data="mean_se",geom="line",size=2))
+    try(p3<-ggplot(data=subset(sub,experiment==as.character(unique(conditions$Compound)[1])),
+                   aes(Temperature,paste(experiment,rep)))+
+          geom_tile(aes(fill=log2(ctrl.ratio)))+
+          scale_fill_gradient2(low="#2166ac",high="#b2182b",midpoint = 0,mid="#f7f7f7")+
+          xlab("Temperature")+ylab("condition")+
+          theme_bw(base_size=12)+
+          theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust=0.5)))
+    try(p4<-ggplot(data=sub,aes(temp,log2(T42C.ratio),fill=setup2,colour=setup2))+
+          stat_summary(fun.data="mean_se",geom="smooth")+
+          theme_bw(base_size=12)+ 
+          theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+          scale_fill_manual(values = cols)+
+          scale_colour_manual(values = cols)+
+          stat_summary(fun.data="mean_se",geom="line",size=2))
+    
+    if(gene%in%limma.cp.data$gene_name){
+      sub<-subset(limma.cp.data,gene_name==gene)
+      new.limits<-limits.limma
+      if(min(sub$score.value,na.rm=T)<new.limits[1]){
+        new.limits[1]<-min(sub$score.value,na.rm=T)
+      }
+      if(max(sub$score.value,na.rm=T)>new.limits[2]){
+        new.limits[2]<-max(sub$score.value,na.rm=T)
+      }
+      try(p5<-ggplot(data=subset(sub),aes(x=rep,score,fill=score.value))+
+            geom_tile()+
+            coord_polar()+
+            scale_fill_gradient2(low="#2166ac",high="#b2182b",
+                                 midpoint = 0,mid="#f7f7f7",
+                                 limits=new.limits)+
+            theme_bw(base_size=12)+
+            xlab("replicate")+
+            geom_text(aes(label=fdr.star)))
+      try(p6<-ggplot(data=sub,aes(x=score,score.value,fill=score,group=score))+
+            geom_boxplot()+
+            geom_point(aes(shape=rep))+
+            theme_bw(base_size=12)+
+            scale_fill_brewer(palette="Set1")+
+            # coord_cartesian(ylim = new.limits)+
+            geom_text(aes(label=fdr.star),show.legend = FALSE)+
+            geom_hline(yintercept=0)+
+            theme(axis.text.x = element_text(angle = 90, hjust = 1,vjust = 0.5)))
+      try(suppressWarnings( print(grid.arrange(p1, p2, p3, p4,p5,p6,ncol=2,top=ptitle))))
+    }else{
+      try(suppressWarnings( print(grid.arrange(p1, p2, p3, p4, ncol=2,top=ptitle))))
+    }
+    dev.off()
+    rm(sub,min.p.value,new.limits,max.qupm,average.top3)
+  }
+}
+```
